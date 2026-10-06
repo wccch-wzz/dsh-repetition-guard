@@ -126,6 +126,21 @@ Removal is the mirror image:
 dsh plugin --profile web remove dsh-repetition-guard
 ```
 
+**Under proot, or any container that maps hard links to symlinks, pnpm's store cannot link and the install aborts** with `failed to import ... No such file or directory`. The tarball is unpacked before that step, so the plugin files land correctly and only the manifest update is lost — finish by hand: confirm the unpacked directory sits in the profile's `node_modules/`, then declare it in both the `dependencies` map and `dsh.profile.bundles`.
+
+```json
+{
+  "dependencies": {
+    "dsh-repetition-guard": "file:./node_modules/dsh-repetition-guard"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["...", "dsh-repetition-guard"]
+    }
+  }
+}
+```
+
 `examples/dynamic-plugin.host.js` is an equivalent dynamic Cordis plugin that activates in-process without a restart, at the cost of disappearing with the process.
 
 ## Verification

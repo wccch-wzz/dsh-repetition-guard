@@ -126,6 +126,21 @@ dsh plugin --profile web add https://github.com/wccch-wzz/dsh-repetition-guard/a
 dsh plugin --profile web remove dsh-repetition-guard
 ```
 
+**在 proot 下，或任何把 hard link 映射成符号链接的容器里，pnpm 的存储无法建链，安装会中断**并报 `failed to import ... No such file or directory`。tarball 在那一步之前就已解包，因此插件文件本身落位正确，只是清单更新丢失 —— 手工补上即可：确认解包目录已在 profile 的 `node_modules/` 中，然后在 `dependencies` 映射与 `dsh.profile.bundles` 里同时声明它。
+
+```json
+{
+  "dependencies": {
+    "dsh-repetition-guard": "file:./node_modules/dsh-repetition-guard"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["...", "dsh-repetition-guard"]
+    }
+  }
+}
+```
+
 `examples/dynamic-plugin.host.js` 是等价的动态 Cordis 插件，无需重启即在进程内激活，代价是随进程消失。
 
 ## 验证
