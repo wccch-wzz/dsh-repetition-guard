@@ -1,173 +1,118 @@
-# dsh-repetition-guard
+# `dsh-repetition-guard`
 
-DeepSeek Harness 的**重复输出抑制器**：在 `llm/stream` 层拦截并扼制大模型思维链与正文的退化性重复输出（`ok` / `好的` / `马上` 这类填充词死循环），节省生成与上下文 token。
+English | [中文](README.zh.md)
 
-**provider 无关，按模型匹配** —— 不绑定任何供应商，配一行 glob 即可作用在整个 harness 上。
+Function plugin that suppresses degenerate repetition in streaming model output — the `ok ok ok ok...` / `好的，马上 好的，马上...` collapse that reasoning models fall into when logits are reinforced by their own repeated context. It wraps every streaming model call at the `llm/stream` waterfall, matches by model glob rather than by provider, and when suppression exceeds a configured budget it emits an `error` finish that the agent loop converts into a retry, so the task continues instead of being cut off.
 
-**熔断后自动重试** —— 不是简单打断。抑制量超阈值时触发 agent-loop 重试，任务继续而不是被切断。
+The plugin never rewrites the request. A loop-built request is deep-frozen — its content is a pure function of the session log — so listeners may read it but not mutate it, and a plugin that tries to adjust `temperature` or a penalty field on that object throws. Suppression is therefore applied to the returned `AsyncIterable<StreamChunk>`, not to the call parameters.
 
-```
-guardedCalls: 24    loopTrips: 4    suppressedChars: 8524
-cleanedBlocks: 2    hardStops: 1    detectorErrors: 0
-```
+## How it works
 
-以上是真实模型（`deepseek-v4.1-flash`）上的实测计数，非模拟。
+### Two defenses, neither redundant
 
-## 它解决什么问题
+**Delta suppression.** A sliding tail window is scanned for a repeating unit. On a hit the plugin enters a squelch state and stops forwarding deltas for the duration of the loop.
 
-推理模型在长思维链中会陷入**退化循环**（degeneration）：logits 被上下文里的重复模式自我强化，输出坍缩成同一片段的无限重复。表现就是刷屏式的 `ok ok ok ok...`、`好的，马上 好的，马上...`。
-
-代价有两层：生成时烧 token，更贵的是这些垃圾**进入会话历史**，此后每一轮请求都要重新携带，成倍放大。
-
-## 为什么必须在 llm/stream 层
-
-`llm/stream` 是 Cordis 的 waterfall 事件，包裹**每一次**流式模型调用：
-
-```ts
-'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
-```
-
-它是唯一的流式咽喉，所有 provider、所有会话、主对话与子代理都从这里过。
-
-**但注意**：loop 构建的请求是 deep-frozen 的（内容被设计为会话日志的纯函数），listener 只能读不能改。所以实现方式是**包装返回的 `AsyncIterable`**，而不是修改 `temperature` 之类的请求参数 —— 后者会直接抛异常。
-
-## 两条防线，缺一不可
-
-### 防线一：delta 实时抑制
-
-累积滑动窗口，检测尾部的周期重复，命中后丢弃后续重复帧。
-
-### 防线二：block-end 全文本清除
-
-**这一层是必需的，不是冗余。** `packages/llm/llm/src/assembler.ts` 里写着：
+**Whole-text block-end rewrite.** `@deepseek-ai/dsh-llm`'s assembler marks the `block-end` chunk as authoritative — `assemble()` returns its carried block and ignores everything the deltas accumulated:
 
 ```ts
 /** Set by `block-end` — authoritative, and freezes the partial. */
 block?: ContentBlock
 ```
 
-```ts
-private assemble(partial: PartialBlock, index: number): ContentBlock {
-  if (partial.block) return partial.block   // block-end 优先，完全忽略 delta 累积
+Adapters emit it for both text and reasoning blocks, carrying the complete text. **Dropping deltas without rewriting `block-end` suppresses nothing** — the authoritative block restores the full loop. The plugin therefore runs a whole-text cycle strip over the block and yields a rewritten `block-end` preserving the original `block.type`, which the stream invariant checks against the `block-start` declaration.
+
+### Trigger rule
+
+Both paths share one predicate.
+
+1. The candidate text must reach `minRunChars` (default 120).
+2. Periods `p` from 1 through `min(maxPeriod, length/2)` are tried.
+3. The tail `p` characters form the unit; **a unit containing no letter or digit is skipped** — this is why `-----` and `}}}}}` never trigger.
+4. The count of consecutive exact matches `reps` is measured.
+5. A hit requires **`reps >= minRepeats` and `reps * p >= minRunChars`**.
+
+The second condition makes the two thresholds a single length floor: `reps * p` is the total repeated run. `ok ` needs 40 repetitions, `好的，马上 ` needs 20, a single character needs 120. Normal emphasis such as `非常非常非常重要` (period 2, three repetitions, six characters) stays far below.
+
+The delta path evaluates this every `checkEvery` (48) accumulated characters against a `window` (1024) tail; the block-end path scans the whole text from offset 0.
+
+### Handling
+
+On the delta path a hit enters squelch, and each subsequent delta is counted and **not forwarded** — the UI does not flood and the text never enters the session log. The state exits once `escapeChars` (256) characters of non-repeating content accumulate, meaning the model recovered on its own.
+
+When the suppressed volume reaches `hardStopChars`, the plugin acts according to `hardStopMode`:
+
+- **`retry`** (default) — yields `{ type: 'finish', reason: { kind: 'error', failure: { code: 'REPETITION_LOOP' } } }`. The agent loop dispatches `agent/request-error` for an `error` finish, and this plugin answers `{ kind: 'retry' }`, so the loop's `while (true)` rebuilds the request and generates again.
+- **`stop`** — yields `{ kind: 'stop' }`, ending the task silently. Kept for comparison; this is the pre-v4 behavior.
+- **`off`** — never trips; suppression only.
+
+Retries are counted per `agentId:turn:step` and capped by `maxLoopRetries` (default 2), after which the default outcome applies and the request fails. A loop that is structurally guaranteed — the model was explicitly asked to repeat — exhausts the cap and fails; a transient loop recovers.
+
+Chunks other than `reasoning-delta`, `text-delta`, `block-start` and `block-end` are forwarded untouched, including `usage`, `finish` and `tool-call-delta`. Any exception inside the detection path degrades that single stream to pass-through and is counted; an exception in the gate itself passes the call through rather than blocking it.
+
+## Configuration
+
+```yaml
+- insert:
+    - id: repetition-guard
+      name: 'dsh-repetition-guard'
+      config:
+        models: ['*']
+        minRepeats: 6
+        minRunChars: 120
+        maxPeriod: 32
+        hardStopMode: 'retry'
+        maxLoopRetries: 2
+        hardStopChars: 6000
 ```
 
-而 `llm-pi-ai/src/stream.ts` 证实 reasoning block 也发 block-end 且携带完整文本：
-
-```ts
-case 'thinking_end':
-  yield { type: 'block-end', index: event.contentIndex, block: { type: 'reasoning', text: event.content } }
-```
-
-**只丢 delta 而不重写 block-end，抑制会被它整个还原。** 实测复现过：delta 层转发只剩 140/510 字符，但组装出的消息仍是完整的 510 字符。
-
-所以防线二用 `stripCycles` 做全文本循环清除：把**任意位置**的重复段压缩为一个周期，保留循环前后的有效内容。重写时保留原 `block.type` —— `llm/src/invariant.ts` 会校验 block-end 的类型必须等于 block-start 声明的类型。
-
-## 触发规则
-
-### 门禁（决定这次调用是否被守）
-
-按顺序三道，任一不过即原样放行：
-
-1. `options.purpose !== undefined` 且 `guardAuxiliary` 为假 —— compaction / session-title 这类辅助调用默认不守
-2. provider 不匹配 `providers` glob
-3. 模型不匹配 `models` glob
-
-默认 `['*']` 对两者都是全匹配，实际为全守。
-
-### 判据
-
-两条路径共用同一套判据。
-
-1. 前置门：文本长度 < `minRunChars`（默认 120）→ 不判
-2. 枚举周期 `p` 从 1 到 `min(maxPeriod, 长度/2)`
-3. 取尾部 `p` 个字符作 `unit`；**`unit` 不含字母或数字就跳过该周期**（`/[\p{L}\p{N}]/u`）—— 这是 `-----`、`}}}}}` 不触发的原因
-4. 数 `unit` 连续精确匹配的次数 `reps`
-5. **命中条件：`reps ≥ minRepeats` 且 `reps × p ≥ minRunChars`**
-
-双阈值的实际含义（`reps × p` 就是重复段总字符数）：
-
-| 循环形态 | 周期 p | 需要重复次数 |
+| Key | Default | Meaning |
 |---|---|---|
-| `aaaaaaaa...` | 1 | ≥ 120 |
-| `ok ok ok ...` | 3 | ≥ 40 |
-| `好的，马上 好的，马上 ...` | 6 | ≥ 20 |
+| `models` | `['*']` | Model glob; `['*flash*']` narrows it |
+| `providers` | `['*']` | Provider glob |
+| `guardAuxiliary` | `false` | Also guard compaction / session-title calls |
+| `reasoning` / `text` | `true` | Which delta channels are guarded |
+| `minRepeats` / `minRunChars` | `6` / `120` | Hit thresholds |
+| `maxPeriod` | `32` | Largest period considered, in characters |
+| `window` / `checkEvery` | `1024` / `48` | Delta scan window and cadence |
+| `escapeChars` | `256` | New content needed to leave squelch |
+| `hardStop` / `hardStopMode` | `true` / `'retry'` | Whether and how to trip |
+| `hardStopChars` | `6000` | Suppressed volume that trips |
+| `maxLoopRetries` | `2` | Retries per turn/step before failing |
+| `maxScanChars` | `200000` | Block-end scan ceiling; above it the tail check is used |
 
-两条必须同时满足。所以「非常非常非常重要」（周期 2、3 次、6 字符）安全，「哈哈哈哈」也安全。
+## Model Experience
 
-### 两条路径的作用面
+### What the model sees
 
-- **delta 检测**：只作用于 `reasoning-delta` 与 `text-delta`，每累积 `checkEvery`（48）字符检测一次，窗口上限 `window`（1024）
-- **block-end 清除**：只作用于 `block.type` 为 `reasoning`/`text` 且 `text` 是字符串的 block，从位置 0 全文本扫描
+Nothing about the suppression. The model produced the loop; the plugin dropped it downstream. The rewritten `block-end` means the durable assistant message carries the stripped text, so a later turn reads a compressed version of its own output rather than the full repetition.
 
-## 处理办法
+A retry is likewise invisible. The loop rebuilds the same request from durable surface history, and the failed attempt left no `assistant/message` — failed chunks are recorded for replay but never become derived messages — so the retry starts from an uncontaminated history.
 
-### delta 路径：四级处置
+### Token effect
 
-1. **命中** —— 进入抑制态，记 `trips`
-2. **抑制** —— 抑制期内每个 delta 累加计数并**不转发**。UI 不刷屏、内容不进会话历史
-3. **熔断** —— 抑制量达 `hardStopChars` 时按 `hardStopMode` 处置（见下节）
-4. **恢复** —— 抑制期内若检测不再命中，累积 `escapeChars`（256）后退出抑制态，恢复正常转发
+Suppression alone does **not** stop generation: the model keeps producing, and output tokens for the suppressed span are still billed. What is saved is **context**: the suppressed text never enters the session log, so it is not re-sent on every subsequent request.
 
-遇到 `block-start` 时重置全部状态（新 block 意味着上一段结束）。
+Generation tokens are saved only when the plugin trips. Tripping `break`s out of the stream, which calls the upstream generator's `return()` and lets the adapter abort the HTTP request.
 
-### block-end 路径
+A retry is a new provider request and repeats input-token billing for the reconstructed prefix. `maxLoopRetries` bounds that cost.
 
-计算 `stripCycles(text)`。若与原文不同则重写该 block-end 并计数；相同则原样透传。
+### KV Cache effect
 
-### 原样透传
+Suppression does not alter any request, so cache identity is untouched. A retry reconstructs a request preserving the prior prefix and is eligible for provider cache reuse under that provider's rules, exactly as `dsh-llm-retry` describes for its own retries.
 
-`usage`、`finish`、`tool-call-delta`、`block-start`，以及任何未知 chunk 类型。
+## Known Limitations
 
-### 失败安全
+- **Near-periodic loops are missed** — the match is exact, so a unit that drifts (`ok ok 好的 ok ok 好的`) fails the comparison. Deliberately so: fuzzy matching would need a tolerance that trades this miss against false positives on legitimate prose.
+- **Periods beyond `maxPeriod` are missed** — a model repeating a 200-character reasoning paragraph in full is not detected.
+- **Runs under `minRunChars` do not trigger** — a repetition shorter than the floor is treated as ordinary expression.
+- **Suppression is not termination** — except when tripping, the model keeps generating and the generation tokens are still billed.
+- **A retry discards the attempt** — content produced before the loop in the failed attempt is lost. A looping response is usually low-value, but this is a real cost.
+- **Structurally guaranteed loops are unrecoverable** — retries cannot fix a loop the prompt demands; the cap is reached and the request fails by design.
+- **`hardStopChars` governs the tradeoff** — a lower value trips earlier and saves more generation tokens at the cost of more retries.
 
-1. delta 检测抛异常 → 该条流此后纯透传（仅本条流，非全局降级）
-2. block-end 检测抛异常 → 该 block 原样透传，仅计数
-3. 门禁本身抛异常 → 原样放行，绝不阻断模型调用
+## Installation
 
-## 熔断后自动重试
-
-早期版本熔断时发 `{kind:'stop'}`，任务在此**静默中断**。实测代价：子代理输出被截在 147 字符，后续步骤根本没执行 —— 因为它用 `stop` 而非 `error` 是刻意躲开重试的，也就没有恢复路径。
-
-v4 改为发 `{kind:'error', failure:{code:'REPETITION_LOOP'}}`，触发 `agent/request-error` waterfall，由本插件返回 `{kind:'retry'}`：
-
-```ts
-// core/agent-loop/src/agent.ts:339
-while (true) {                                    // ← 这本身就是重试循环
-  const stream = ...llm.stream(request)
-  for await (const chunk of stream) { assembler.push(chunk) }
-  const finish = assembler.finish
-  if (finish.kind === 'error' || finish.kind === 'aborted') {
-    const action = await this.dispatch.waterfall('agent/request-error', {...},
-      () => Promise.resolve(undefined))           // 默认：不重试 → 抛 LlmError
-    if (action?.kind !== 'retry') throw new LlmError(...)
-    continue                                      // ← 返回 retry 即重新生成
-  }
-  // assistant 消息只在这里落库
-  this.session.append('assistant/message', ...)
-}
-```
-
-**重试是干净的**：assistant 消息只在正常 finish 后 append，error 路径不落库，所以重试不会被上一次的重复内容污染。
-
-重试次数按 `agentId:turn:step` 计数，超过 `maxLoopRetries` 即放行默认行为（抛错终止），避免无限重试。
-
-三种模式可选：
-
-| `hardStopMode` | 行为 |
-|---|---|
-| `'retry'`（默认） | 熔断后重试，任务继续 |
-| `'stop'` | 熔断后静默结束，任务中断（旧行为） |
-| `'off'` | 不熔断，只抑制 |
-
-## 一个必须记住的语义区别
-
-delta 抑制期间**模型仍在生成**，生成 token 照付。省下的是**上下文 token** —— 被抑制的内容不进会话历史，后续每轮不再携带。
-
-真正省生成 token 的是熔断：`break` 触发上游 generator 的 `return()`，adapter 据此 abort HTTP。想更激进就把 `hardStopChars` 降到 1500 左右。
-
-## 安装
-
-作为 dsh profile 的 bundle 安装。把本仓库放进 profile 的 `node_modules/`，然后在 profile 的 `package.json` 里注册：
+As a dsh profile bundle. Place the repository under the profile's `node_modules/` and register it:
 
 ```json
 {
@@ -187,89 +132,34 @@ delta 抑制期间**模型仍在生成**，生成 token 照付。省下的是**�
 }
 ```
 
-重启 dsh 生效。
+Restart dsh. `examples/dynamic-plugin.host.js` is an equivalent dynamic Cordis plugin that activates in-process without a restart, at the cost of disappearing with the process.
 
-仓库里的 `examples/dynamic-plugin.host.js` 是等价的**动态 Cordis 插件**版本，不需要重启，用 `cordis_define` + `cordis_run` 即可在当前进程内激活，代价是进程重启后消失。两者算法同源。
-
-## 配置
-
-改 `cordis.patch.yml` 的 `config:` 段。`patchReload: live` 时多数情况免重启。
-
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `models` | `['*']` | 模型 glob，`['*flash*']` 可收窄 |
-| `providers` | `['*']` | provider glob |
-| `guardAuxiliary` | `false` | 是否也守 compaction / session-title |
-| `reasoning` | `true` | 守思维链通道 |
-| `text` | `true` | 守正文通道 |
-| `minRepeats` | `6` | 最小重复次数 |
-| `minRunChars` | `120` | 重复段最小总字符数 |
-| `maxPeriod` | `32` | 最大重复周期（字符） |
-| `window` | `1024` | delta 检测滑动窗口 |
-| `checkEvery` | `48` | 每累积多少字符检测一次 |
-| `escapeChars` | `256` | 判定已恢复所需的新内容量 |
-| `hardStop` | `true` | 是否启用熔断 |
-| `hardStopMode` | `'retry'` | `retry` / `stop` / `off` |
-| `maxLoopRetries` | `2` | 同一 turn/step 的最大循环重试次数 |
-| `hardStopChars` | `6000` | 熔断阈值 |
-| `maxScanChars` | `200000` | block-end 全量扫描上限 |
-| `verbose` | `false` | 详细日志 |
-
-## 验证
+## Verification
 
 ```sh
-node tests/guard-test.mjs        # 29 项：算法边界、误伤防护、性能
-node tests/integration-test.mjs  # 26 项：加载真实模块 + mock ctx
+node tests/guard-test.mjs        # 29 assertions: predicate boundaries, false-positive guards, performance
+node tests/integration-test.mjs  # 26 assertions: loads the real module, mocks a Cordis ctx
 ```
 
-真实模型上的运行时计数（`deepseek-v4.1-flash`，`openai-completions` 协议）：
+Runtime counters against a live `deepseek-v4.1-flash` route speaking `openai-completions`:
 
 ```
-guardedCalls: 24    skippedCalls: 0    loopTrips: 4
-recoveries: 1       hardStops: 1       cleanedBlocks: 2
-suppressedChars: 8524                  detectorErrors: 0
+guardedCalls: 8     loopTrips: 8     recoveries: 5     detectorErrors: 0
+hardStops: 3        hardStopsRetry: 3    hardStopsStop: 0
+retries: 2          retriesExhausted: 1
+suppressedChars: 19643
+cleanedBlocks: 2
 ```
 
-`cleanedBlocks: 2` 证明 block-end 路径在真实 token 流上生效；`suppressedChars: 8524` 是真实抑制量。
+`hardStopsStop: 0` records that no trip ended a task silently. `cleanedBlocks: 2` records that the authoritative block-end path fired on real token streams, not only in tests.
 
-## 已知边界
+## Version History
 
-- **近周期循环会漏检**：若重复片段有微小变化（`ok ok 好的 ok ok 好的` 里周期漂移），精确匹配失败
-- **周期超过 32 字符会漏检**：例如整段 200 字符推理的重复
-- **不足 120 字符的重复不触发**：阈值以下视为正常表达
-- **抑制的是内容，不是停止生成**：除熔断外模型仍在生成，省的是上下文 token
-- **重试是重新生成整个响应**：循环前已产生的有效内容会随重试丢弃（但循环响应本身质量差，通常不亏）
+**v1 → v2.** The first version ran the tail check against `block-end`. When a loop was followed by ordinary content the tail was no longer periodic, the check missed, and the authoritative block restored everything that had been suppressed. Measured: deltas forwarded 140 of 510 characters, assembled message still 510. Replaced with the whole-text cycle strip.
 
-## 踩过的坑
+**v2 → v3.** `detectCycle` returned `{period, reps, start, chars}` without a `unit` field, while the trip log read `hit.unit.slice(0, 24)`. Argument evaluation precedes the callee's own `try`, so the log's guard never applied: the first genuine detection threw, set the stream-wide bypass flag, and **disabled suppression at exactly the moment it was needed**. The unit test missed it because it exercised a hand-copied algorithm rather than the shipped module; only the integration test that imports the real file caught it.
 
-### v1 → v2：block-end 是 authoritative
-
-初版只在 block-end 上做尾部周期检测。当「循环后又接正常内容」时尾部不是循环，检测漏掉，被抑制的垃圾被 authoritative 的 block-end 完整还原。实测：delta 转发 140/510，组装结果仍是 510 字符。
-
-改为全文本循环清除。
-
-### v2 → v3：一个会自我禁用的致命 bug
-
-`detectCycle` 返回 `{period, reps, start, chars}` 却没有 `unit` 字段，而 trip 日志读取了 `hit.unit.slice(0, 24)`。**参数求值发生在 `log()` 自身的 try/catch 之前**，所以一旦真的检测到循环就抛 `TypeError` → `bypass = true` → 整条流永久降级为透传 → **抑制完全失效**。
-
-插件恰好在最需要它工作的那一刻自我禁用。
-
-更值得记的是：**这个 bug 骗过了单元测试**，因为那份测试跑的是手工复制的算法副本，没带那行日志。只有直接 import 落盘模块的集成测试才把它揪出来。
-
-**能被证伪的测试才算测试。**
-
-### v3 → v4：熔断不该静默中断任务
-
-v3 用 `{kind:'stop'}` 是刻意躲开 `llm-retry` 的重试，防止「重试又循环」。代价是没有恢复路径：熔断即任务终止。
-
-实测对照 —— 让子代理先输出重复内容再执行第二步：
-
-| 版本 | 熔断后 | 第二步 |
-|---|---|---|
-| v3（stop） | 静默结束 | **未执行** |
-| v4（retry） | 触发重试 | 执行 |
-
-正确做法是 `error` + 自定义 code + 限次重试，而不是绕开重试机制。
+**v3 → v4.** Tripping emitted `{kind: 'stop'}` to avoid the retry machinery, which left no recovery path — measured, a subagent's output was cut at 147 characters and its next step never ran. Now an `error` finish with a private code drives the retry, and `maxLoopRetries` bounds it.
 
 ## License
 
