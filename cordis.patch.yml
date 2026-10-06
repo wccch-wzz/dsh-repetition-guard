@@ -1,0 +1,19 @@
+- insert:
+    - id: repetition-guard
+      name: 'dsh-repetition-guard'
+      config:
+        models: ['*']
+        providers: ['*']
+        guardAuxiliary: false
+        reasoning: true
+        text: true
+        minRepeats: 6
+        minRunChars: 120
+        maxPeriod: 32
+        window: 1024
+        checkEvery: 48
+        escapeChars: 256
+        hardStop: true
+        hardStopChars: 6000
+        maxScanChars: 200000
+        verbose: true

@@ -1,0 +1,51 @@
+{
+  "name": "dsh-repetition-guard",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 重复输出抑制器：在 llm/stream 层拦截思维链与正文的退化性重复（ok/好的/马上 死循环），provider 无关，按模型匹配。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/guard-test.mjs && node tests/integration-test.mjs"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "repetition",
+    "degeneration",
+    "llm-stream",
+    "cordis"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wccch-wzz/dsh-repetition-guard.git"
+  },
+  "homepage": "https://github.com/wccch-wzz/dsh-repetition-guard#readme",
+  "bugs": {
+    "url": "https://github.com/wccch-wzz/dsh-repetition-guard/issues"
+  }
+}
