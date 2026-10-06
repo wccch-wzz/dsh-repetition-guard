@@ -1,4 +1,4 @@
-# `dsh-repetition-guard`
+# `dsh-repetition-suppressor`
 
 English | [中文](README.zh.md)
 
@@ -54,7 +54,7 @@ Chunks other than `reasoning-delta`, `text-delta`, `block-start` and `block-end`
 ```yaml
 - insert:
     - id: repetition-guard
-      name: 'dsh-repetition-guard'
+      name: 'dsh-repetition-suppressor'
       config:
         models: ['*']
         minRepeats: 6
@@ -112,7 +112,13 @@ Suppression does not alter any request, so cache identity is untouched. A retry 
 
 ## Installation
 
-Install straight from this repository. `dsh plugin` forwards its arguments to pnpm inside the profile directory and reconciles `dsh.profile.bundles` once pnpm exits, so no manifest editing is needed:
+```sh
+dsh plugin --profile web add dsh-repetition-suppressor
+```
+
+`dsh plugin` forwards its arguments to pnpm inside the profile directory and reconciles `dsh.profile.bundles` once pnpm exits, so no manifest editing is needed. Restart dsh to load the bundle. Substitute your own profile name for `web` if you run a different one.
+
+The same code straight from the repository, if you prefer an unpinned source:
 
 ```sh
 dsh plugin --profile web add https://github.com/wccch-wzz/dsh-repetition-guard/archive/refs/heads/main.tar.gz
@@ -123,7 +129,7 @@ Restart dsh to load the bundle. Substitute your own profile name for `web` if yo
 Removal is the mirror image:
 
 ```sh
-dsh plugin --profile web remove dsh-repetition-guard
+dsh plugin --profile web remove dsh-repetition-suppressor
 ```
 
 **Under proot, or any container that maps hard links to symlinks, pnpm's store cannot link and the install aborts** with `failed to import ... No such file or directory`. The tarball is unpacked before that step, so the plugin files land correctly and only the manifest update is lost — finish by hand: confirm the unpacked directory sits in the profile's `node_modules/`, then declare it in both the `dependencies` map and `dsh.profile.bundles`.
@@ -131,11 +137,11 @@ dsh plugin --profile web remove dsh-repetition-guard
 ```json
 {
   "dependencies": {
-    "dsh-repetition-guard": "file:./node_modules/dsh-repetition-guard"
+    "dsh-repetition-suppressor": "file:./node_modules/dsh-repetition-suppressor"
   },
   "dsh": {
     "profile": {
-      "bundles": ["...", "dsh-repetition-guard"]
+      "bundles": ["...", "dsh-repetition-suppressor"]
     }
   }
 }

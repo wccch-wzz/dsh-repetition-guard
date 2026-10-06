@@ -1,4 +1,4 @@
-# `dsh-repetition-guard`
+# `dsh-repetition-suppressor`
 
 [English](README.md) | 中文
 
@@ -54,7 +54,7 @@ delta 路径命中即进入抑制态，此后每个 delta 只计数、**不转�
 ```yaml
 - insert:
     - id: repetition-guard
-      name: 'dsh-repetition-guard'
+      name: 'dsh-repetition-suppressor'
       config:
         models: ['*']
         minRepeats: 6
@@ -112,7 +112,13 @@ delta 路径命中即进入抑制态，此后每个 delta 只计数、**不转�
 
 ## 安装
 
-直接从本仓库安装。`dsh plugin` 把参数转发给 profile 目录下的 pnpm，并在 pnpm 退出后同步 `dsh.profile.bundles`，因此无需手工编辑清单：
+```sh
+dsh plugin --profile web add dsh-repetition-suppressor
+```
+
+`dsh plugin` 把参数转发给 profile 目录下的 pnpm，并在 pnpm 退出后同步 `dsh.profile.bundles`，因此无需手工编辑清单。重启 dsh 以加载 bundle。若你运行的是其他 profile，把 `web` 换成对应名字。
+
+若你更想从仓库取不锁版本的同一份代码：
 
 ```sh
 dsh plugin --profile web add https://github.com/wccch-wzz/dsh-repetition-guard/archive/refs/heads/main.tar.gz
@@ -123,7 +129,7 @@ dsh plugin --profile web add https://github.com/wccch-wzz/dsh-repetition-guard/a
 卸载是对称的：
 
 ```sh
-dsh plugin --profile web remove dsh-repetition-guard
+dsh plugin --profile web remove dsh-repetition-suppressor
 ```
 
 **在 proot 下，或任何把 hard link 映射成符号链接的容器里，pnpm 的存储无法建链，安装会中断**并报 `failed to import ... No such file or directory`。tarball 在那一步之前就已解包，因此插件文件本身落位正确，只是清单更新丢失 —— 手工补上即可：确认解包目录已在 profile 的 `node_modules/` 中，然后在 `dependencies` 映射与 `dsh.profile.bundles` 里同时声明它。
@@ -131,11 +137,11 @@ dsh plugin --profile web remove dsh-repetition-guard
 ```json
 {
   "dependencies": {
-    "dsh-repetition-guard": "file:./node_modules/dsh-repetition-guard"
+    "dsh-repetition-suppressor": "file:./node_modules/dsh-repetition-suppressor"
   },
   "dsh": {
     "profile": {
-      "bundles": ["...", "dsh-repetition-guard"]
+      "bundles": ["...", "dsh-repetition-suppressor"]
     }
   }
 }

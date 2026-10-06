@@ -1,5 +1,5 @@
 {
-  "name": "dsh-repetition-guard",
+  "name": "dsh-repetition-suppressor",
   "version": "1.0.0",
   "description": "DeepSeek Harness 重复输出抑制器：在 llm/stream 层拦截思维链与正文的退化性重复（ok/好的/马上 死循环），provider 无关，按模型匹配。",
   "type": "module",

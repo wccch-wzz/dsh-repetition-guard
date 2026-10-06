@@ -1,6 +1,6 @@
 - insert:
     - id: repetition-guard
-      name: 'dsh-repetition-guard'
+      name: 'dsh-repetition-suppressor'
       config:
         models: ['*']
         providers: ['*']
