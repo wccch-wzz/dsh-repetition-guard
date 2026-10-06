@@ -112,27 +112,21 @@ Suppression does not alter any request, so cache identity is untouched. A retry 
 
 ## Installation
 
-As a dsh profile bundle. Place the repository under the profile's `node_modules/` and register it:
+Install straight from this repository. `dsh plugin` forwards its arguments to pnpm inside the profile directory and reconciles `dsh.profile.bundles` once pnpm exits, so no manifest editing is needed:
 
-```json
-{
-  "dependencies": {
-    "dsh-repetition-guard": "file:./node_modules/dsh-repetition-guard"
-  },
-  "dsh": {
-    "profile": {
-      "bundles": [
-        "@deepseek-ai/dsh-base",
-        "@deepseek-ai/dsh-web-app",
-        "dsh-repetition-guard"
-      ],
-      "patchReload": "live"
-    }
-  }
-}
+```sh
+dsh plugin --profile web add https://github.com/wccch-wzz/dsh-repetition-guard/archive/refs/heads/main.tar.gz
 ```
 
-Restart dsh. `examples/dynamic-plugin.host.js` is an equivalent dynamic Cordis plugin that activates in-process without a restart, at the cost of disappearing with the process.
+Restart dsh to load the bundle. Substitute your own profile name for `web` if you run a different one.
+
+Removal is the mirror image:
+
+```sh
+dsh plugin --profile web remove dsh-repetition-guard
+```
+
+`examples/dynamic-plugin.host.js` is an equivalent dynamic Cordis plugin that activates in-process without a restart, at the cost of disappearing with the process.
 
 ## Verification
 

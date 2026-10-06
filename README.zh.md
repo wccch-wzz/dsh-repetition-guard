@@ -112,27 +112,21 @@ delta 路径命中即进入抑制态，此后每个 delta 只计数、**不转�
 
 ## 安装
 
-作为 dsh profile 的 bundle。把本仓库放进 profile 的 `node_modules/` 并注册：
+直接从本仓库安装。`dsh plugin` 把参数转发给 profile 目录下的 pnpm，并在 pnpm 退出后同步 `dsh.profile.bundles`，因此无需手工编辑清单：
 
-```json
-{
-  "dependencies": {
-    "dsh-repetition-guard": "file:./node_modules/dsh-repetition-guard"
-  },
-  "dsh": {
-    "profile": {
-      "bundles": [
-        "@deepseek-ai/dsh-base",
-        "@deepseek-ai/dsh-web-app",
-        "dsh-repetition-guard"
-      ],
-      "patchReload": "live"
-    }
-  }
-}
+```sh
+dsh plugin --profile web add https://github.com/wccch-wzz/dsh-repetition-guard/archive/refs/heads/main.tar.gz
 ```
 
-重启 dsh。`examples/dynamic-plugin.host.js` 是等价的动态 Cordis 插件，无需重启即在进程内激活，代价是随进程消失。
+重启 dsh 以加载 bundle。若你运行的是其他 profile，把 `web` 换成对应名字。
+
+卸载是对称的：
+
+```sh
+dsh plugin --profile web remove dsh-repetition-guard
+```
+
+`examples/dynamic-plugin.host.js` 是等价的动态 Cordis 插件，无需重启即在进程内激活，代价是随进程消失。
 
 ## 验证
 
