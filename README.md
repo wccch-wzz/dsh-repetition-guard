@@ -4,9 +4,11 @@ DeepSeek Harness 的**重复输出抑制器**：在 `llm/stream` 层拦截并扼
 
 **provider 无关，按模型匹配** —— 不绑定任何供应商，配一行 glob 即可作用在整个 harness 上。
 
+**熔断后自动重试** —— 不是简单打断。抑制量超阈值时触发 agent-loop 重试，任务继续而不是被切断。
+
 ```
 guardedCalls: 24    loopTrips: 4    suppressedChars: 8524
-cleanedBlocks: 2    hardStops: 1    recoveries: 1    detectorErrors: 0
+cleanedBlocks: 2    hardStops: 1    detectorErrors: 0
 ```
 
 以上是真实模型（`deepseek-v4.1-flash`）上的实测计数，非模拟。
@@ -103,7 +105,7 @@ case 'thinking_end':
 
 1. **命中** —— 进入抑制态，记 `trips`
 2. **抑制** —— 抑制期内每个 delta 累加计数并**不转发**。UI 不刷屏、内容不进会话历史
-3. **熔断** —— 抑制量达 `hardStopChars`（默认 6000）时，发出 `{type:'finish', reason:{kind:'stop'}}` 并终止流。终止会触发上游 generator 的 `return()`，adapter 据此 abort HTTP —— **这是唯一真正省生成 token 的动作**。用 `stop` 而非 `aborted`，避免 `llm-retry` 把它当失败重试（重试只会再循环一次）
+3. **熔断** —— 抑制量达 `hardStopChars` 时按 `hardStopMode` 处置（见下节）
 4. **恢复** —— 抑制期内若检测不再命中，累积 `escapeChars`（256）后退出抑制态，恢复正常转发
 
 遇到 `block-start` 时重置全部状态（新 block 意味着上一段结束）。
@@ -122,11 +124,46 @@ case 'thinking_end':
 2. block-end 检测抛异常 → 该 block 原样透传，仅计数
 3. 门禁本身抛异常 → 原样放行，绝不阻断模型调用
 
-## 一个重要语义区别
+## 熔断后自动重试
+
+早期版本熔断时发 `{kind:'stop'}`，任务在此**静默中断**。实测代价：子代理输出被截在 147 字符，后续步骤根本没执行 —— 因为它用 `stop` 而非 `error` 是刻意躲开重试的，也就没有恢复路径。
+
+v4 改为发 `{kind:'error', failure:{code:'REPETITION_LOOP'}}`，触发 `agent/request-error` waterfall，由本插件返回 `{kind:'retry'}`：
+
+```ts
+// core/agent-loop/src/agent.ts:339
+while (true) {                                    // ← 这本身就是重试循环
+  const stream = ...llm.stream(request)
+  for await (const chunk of stream) { assembler.push(chunk) }
+  const finish = assembler.finish
+  if (finish.kind === 'error' || finish.kind === 'aborted') {
+    const action = await this.dispatch.waterfall('agent/request-error', {...},
+      () => Promise.resolve(undefined))           // 默认：不重试 → 抛 LlmError
+    if (action?.kind !== 'retry') throw new LlmError(...)
+    continue                                      // ← 返回 retry 即重新生成
+  }
+  // assistant 消息只在这里落库
+  this.session.append('assistant/message', ...)
+}
+```
+
+**重试是干净的**：assistant 消息只在正常 finish 后 append，error 路径不落库，所以重试不会被上一次的重复内容污染。
+
+重试次数按 `agentId:turn:step` 计数，超过 `maxLoopRetries` 即放行默认行为（抛错终止），避免无限重试。
+
+三种模式可选：
+
+| `hardStopMode` | 行为 |
+|---|---|
+| `'retry'`（默认） | 熔断后重试，任务继续 |
+| `'stop'` | 熔断后静默结束，任务中断（旧行为） |
+| `'off'` | 不熔断，只抑制 |
+
+## 一个必须记住的语义区别
 
 delta 抑制期间**模型仍在生成**，生成 token 照付。省下的是**上下文 token** —— 被抑制的内容不进会话历史，后续每轮不再携带。
 
-真正省生成 token 的只有熔断那一刀。想更激进就把 `hardStopChars` 降到 1500 左右。
+真正省生成 token 的是熔断：`break` 触发上游 generator 的 `return()`，adapter 据此 abort HTTP。想更激进就把 `hardStopChars` 降到 1500 左右。
 
 ## 安装
 
@@ -172,6 +209,8 @@ delta 抑制期间**模型仍在生成**，生成 token 照付。省下的是**�
 | `checkEvery` | `48` | 每累积多少字符检测一次 |
 | `escapeChars` | `256` | 判定已恢复所需的新内容量 |
 | `hardStop` | `true` | 是否启用熔断 |
+| `hardStopMode` | `'retry'` | `retry` / `stop` / `off` |
+| `maxLoopRetries` | `2` | 同一 turn/step 的最大循环重试次数 |
 | `hardStopChars` | `6000` | 熔断阈值 |
 | `maxScanChars` | `200000` | block-end 全量扫描上限 |
 | `verbose` | `false` | 详细日志 |
@@ -180,7 +219,7 @@ delta 抑制期间**模型仍在生成**，生成 token 照付。省下的是**�
 
 ```sh
 node tests/guard-test.mjs        # 29 项：算法边界、误伤防护、性能
-node tests/integration-test.mjs  # 14 项：加载真实模块 + mock ctx
+node tests/integration-test.mjs  # 26 项：加载真实模块 + mock ctx
 ```
 
 真实模型上的运行时计数（`deepseek-v4.1-flash`，`openai-completions` 协议）：
@@ -199,6 +238,7 @@ suppressedChars: 8524                  detectorErrors: 0
 - **周期超过 32 字符会漏检**：例如整段 200 字符推理的重复
 - **不足 120 字符的重复不触发**：阈值以下视为正常表达
 - **抑制的是内容，不是停止生成**：除熔断外模型仍在生成，省的是上下文 token
+- **重试是重新生成整个响应**：循环前已产生的有效内容会随重试丢弃（但循环响应本身质量差，通常不亏）
 
 ## 踩过的坑
 
@@ -217,6 +257,19 @@ suppressedChars: 8524                  detectorErrors: 0
 更值得记的是：**这个 bug 骗过了单元测试**，因为那份测试跑的是手工复制的算法副本，没带那行日志。只有直接 import 落盘模块的集成测试才把它揪出来。
 
 **能被证伪的测试才算测试。**
+
+### v3 → v4：熔断不该静默中断任务
+
+v3 用 `{kind:'stop'}` 是刻意躲开 `llm-retry` 的重试，防止「重试又循环」。代价是没有恢复路径：熔断即任务终止。
+
+实测对照 —— 让子代理先输出重复内容再执行第二步：
+
+| 版本 | 熔断后 | 第二步 |
+|---|---|---|
+| v3（stop） | 静默结束 | **未执行** |
+| v4（retry） | 触发重试 | 执行 |
+
+正确做法是 `error` + 自定义 code + 限次重试，而不是绕开重试机制。
 
 ## License
 

@@ -14,6 +14,11 @@
         checkEvery: 48
         escapeChars: 256
         hardStop: true
+        # 'retry' 熔断后发 error 触发 agent-loop 重试，任务继续（推荐）
+        # 'stop'  熔断后静默结束，任务中断（旧行为）
+        # 'off'   不熔断，只抑制
+        hardStopMode: 'retry'
+        maxLoopRetries: 2
         hardStopChars: 6000
         maxScanChars: 200000
         verbose: true
