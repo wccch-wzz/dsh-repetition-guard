@@ -8,9 +8,16 @@ The plugin never rewrites the request. A loop-built request is deep-frozen — i
 
 ## How it works
 
-### Two defenses, neither redundant
+### Two detection signals
 
-**Delta suppression.** A sliding tail window is scanned for a repeating unit. On a hit the plugin enters a squelch state and stops forwarding deltas for the duration of the loop.
+**Periodic detection.** A sliding tail window is scanned for a repeating unit using exact matching. This catches the classic degeneration where output locks onto one string; on a hit the plugin enters a squelch state and stops forwarding deltas for the duration of the loop.
+
+**Collapse detection.** The same window is scored on measures that do not depend on periodicity, catching the near-periodic degeneration exact matching cannot see — a tiny vocabulary rotating in irregular order, where no periodic unit exists but the text is degenerate all the same:
+
+- *n-gram repetition* — the fraction of 8-grams in the window that have already appeared. Eight is the calibrated length: at four, legitimate structured output (JSON arrays, near-identical code lines) scores around 0.80 and would be caught; at eight it falls below 0.68 while genuine loops stay above 0.87.
+- *Token diversity* — the fraction of repeated word tokens, a token being a maximal run of letters and digits. A loop over three filler words keeps this near zero even when no periodic unit exists, which is exactly the case n-gram scoring alone misses.
+
+Either signal reaching `collapseThreshold` (default 0.80) enters the same squelch state.
 
 **Whole-text block-end rewrite.** `@deepseek-ai/dsh-llm`'s assembler marks the `block-end` chunk as authoritative — `assemble()` returns its carried block and ignores everything the deltas accumulated:
 
@@ -19,7 +26,7 @@ The plugin never rewrites the request. A loop-built request is deep-frozen — i
 block?: ContentBlock
 ```
 
-Adapters emit it for both text and reasoning blocks, carrying the complete text. **Dropping deltas without rewriting `block-end` suppresses nothing** — the authoritative block restores the full loop. The plugin therefore runs a whole-text cycle strip over the block and yields a rewritten `block-end` preserving the original `block.type`, which the stream invariant checks against the `block-start` declaration.
+Adapters emit it for both text and reasoning blocks, carrying the complete text. **Dropping deltas without rewriting `block-end` suppresses nothing** — the authoritative block restores the full loop. The plugin therefore rewrites the block before yielding it: a whole-text cycle strip for periodic loops, and a truncation at the collapse start for collapse, keeping everything before it. The rewritten `block-end` preserves the original `block.type`, which the stream invariant checks against the `block-start` declaration.
 
 ### Trigger rule
 
@@ -34,6 +41,12 @@ Both paths share one predicate.
 The second condition makes the two thresholds a single length floor: `reps * p` is the total repeated run. `ok ` needs 40 repetitions, `好的，马上 ` needs 20, a single character needs 120. Normal emphasis such as `非常非常非常重要` (period 2, three repetitions, six characters) stays far below.
 
 The delta path evaluates this every `checkEvery` (48) accumulated characters against a `window` (1024) tail; the block-end path scans the whole text from offset 0.
+
+### Collapse predicate
+
+Scored over the trailing `collapseWindow` (192) characters, requiring at least `collapseMinChars` (96) characters and `collapseMinTokens` (24) tokens. The window counts as collapsed when either `gramScore` or `tokenCollapseScore` reaches `collapseThreshold`.
+
+At block-end the collapse start is located by binary search — the score rises monotonically as normal text is excluded from the prefix — and the block is truncated there, keeping a minimum of 32 characters so a wholly degenerate block still yields something.
 
 ### Handling
 
@@ -71,10 +84,16 @@ Chunks other than `reasoning-delta`, `text-delta`, `block-start` and `block-end`
 | `providers` | `['*']` | Provider glob |
 | `guardAuxiliary` | `false` | Also guard compaction / session-title calls |
 | `reasoning` / `text` | `true` | Which delta channels are guarded |
-| `minRepeats` / `minRunChars` | `6` / `120` | Hit thresholds |
+| `minRepeats` / `minRunChars` | `6` / `120` | Periodic hit thresholds |
 | `maxPeriod` | `32` | Largest period considered, in characters |
 | `window` / `checkEvery` | `1024` / `48` | Delta scan window and cadence |
 | `escapeChars` | `256` | New content needed to leave squelch |
+| `collapse` | `true` | Enable collapse detection |
+| `collapseGram` | `8` | n-gram length |
+| `collapseThreshold` | `0.80` | Score at which either signal trips |
+| `collapseWindow` / `collapseMinChars` | `192` / `96` | Scoring window and its floor |
+| `collapseMinTokens` | `24` | Token floor for the diversity signal |
+| `collapseScanChars` | `8000` | How far back the collapse start is searched |
 | `hardStop` / `hardStopMode` | `true` / `'retry'` | Whether and how to trip |
 | `hardStopChars` | `6000` | Suppressed volume that trips |
 | `maxLoopRetries` | `2` | Retries per turn/step before failing |
@@ -102,9 +121,9 @@ Suppression does not alter any request, so cache identity is untouched. A retry 
 
 ## Known Limitations
 
-- **Near-periodic loops are missed** — the match is exact, so a unit that drifts (`ok ok 好的 ok ok 好的`) fails the comparison. Deliberately so: fuzzy matching would need a tolerance that trades this miss against false positives on legitimate prose.
-- **Periods beyond `maxPeriod` are missed** — a model repeating a 200-character reasoning paragraph in full is not detected.
-- **Runs under `minRunChars` do not trigger** — a repetition shorter than the floor is treated as ordinary expression.
+- **Early self-correction evades detection** — the periodic path needs `minRunChars` (120) characters, the collapse path `collapseMinChars` (96) plus `collapseMinTokens` (24) tokens. A loop that breaks off before either floor is reached passes through.
+- **Periods beyond `maxPeriod` are missed by the periodic path** — the collapse path still catches it when the vocabulary is small, but a long paragraph repeated verbatim with varied vocabulary interleaved can slip past both.
+- **Collapse detection trades recall for precision** — the thresholds were calibrated against JSON arrays, near-identical code lines, log lines, numeric sequences, multi-row tables and base64, all of which stay under 0.68 while genuine loops sit above 0.87. Legitimately formulaic text that none of those samples resemble could in principle score higher than they did.
 - **Suppression is not termination** — except when tripping, the model keeps generating and the generation tokens are still billed.
 - **A retry discards the attempt** — content produced before the loop in the failed attempt is lost. A looping response is usually low-value, but this is a real cost.
 - **Structurally guaranteed loops are unrecoverable** — retries cannot fix a loop the prompt demands; the cap is reached and the request fails by design.
@@ -152,8 +171,9 @@ dsh plugin --profile web remove dsh-repetition-suppressor
 ## Verification
 
 ```sh
-node tests/guard-test.mjs        # 29 assertions: predicate boundaries, false-positive guards, performance
+node tests/guard-test.mjs        # 29 assertions: periodic predicate boundaries, false-positive guards, performance
 node tests/integration-test.mjs  # 26 assertions: loads the real module, mocks a Cordis ctx
+node tests/collapse-test.mjs     # 26 assertions: collapse detection, danger samples, regression
 ```
 
 Runtime counters against a live `deepseek-v4.1-flash` route speaking `openai-completions`:
@@ -175,6 +195,8 @@ cleanedBlocks: 2
 **v2 → v3.** `detectCycle` returned `{period, reps, start, chars}` without a `unit` field, while the trip log read `hit.unit.slice(0, 24)`. Argument evaluation precedes the callee's own `try`, so the log's guard never applied: the first genuine detection threw, set the stream-wide bypass flag, and **disabled suppression at exactly the moment it was needed**. The unit test missed it because it exercised a hand-copied algorithm rather than the shipped module; only the integration test that imports the real file caught it.
 
 **v3 → v4.** Tripping emitted `{kind: 'stop'}` to avoid the retry machinery, which left no recovery path — measured, a subagent's output was cut at 147 characters and its next step never ran. Now an `error` finish with a private code drives the retry, and `maxLoopRetries` bounds it.
+
+**v4 → v5.** Exact period matching is blind to a loop whose unit drifts. Three filler words rotating in irregular order never produce a repeating unit, so the detector never fired — measured, a synthetic irregular loop came through completely untouched at 1398 of 1398 characters. Added n-gram repetition and token diversity as orthogonal signals. Neither suffices alone: the same three-word rotation scores only 0.78 on 8-grams, below the 0.80 threshold, because a three-word alphabet yields too few distinct grams — while token diversity on that same input is 0.995.
 
 ## License
 
